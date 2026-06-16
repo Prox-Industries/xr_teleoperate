@@ -3,6 +3,7 @@ import argparse
 from multiprocessing import Value, Array, Lock
 import threading
 import logging_mp
+import cv2
 logging_mp.basicConfig(level=logging_mp.INFO)
 logger_mp = logging_mp.getLogger(__name__)
 
@@ -69,6 +70,20 @@ def get_state() -> dict:
         "READY": READY,
         "RECORD_RUNNING": RECORD_RUNNING,
     }
+
+def compose_xr_view(head_bgr, left_bgr=None, right_bgr=None):
+    """頭部映像に左右手首を PiP(小窓) で重ね、頭部と同形状のフレームを返す。
+    televuer.render_to_xr は固定形状(img_shape=頭部)を要求するため、合成は頭部フレーム上で行う。"""
+    if head_bgr is None:
+        return None
+    view = head_bgr.copy()
+    h, w = view.shape[:2]
+    pip_w, pip_h = max(1, w // 4), max(1, h // 4)
+    if left_bgr is not None:
+        view[h - pip_h:h, 0:pip_w] = cv2.resize(left_bgr, (pip_w, pip_h))       # 左下: 左手首
+    if right_bgr is not None:
+        view[h - pip_h:h, w - pip_w:w] = cv2.resize(right_bgr, (pip_w, pip_h))  # 右下: 右手首
+    return view
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -250,27 +265,32 @@ if __name__ == '__main__':
         READY = True                  # now ready to (1) enter START state
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
-            if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
+            if xr_need_local_img and camera_config['head_camera']['enable_zmq']:
                 head_img = img_client.get_head_frame()
-                tv_wrapper.render_to_xr(head_img)
+                lw = img_client.get_left_wrist_frame().bgr if camera_config['left_wrist_camera']['enable_zmq'] else None
+                rw = img_client.get_right_wrist_frame().bgr if camera_config['right_wrist_camera']['enable_zmq'] else None
+                tv_wrapper.render_to_xr(compose_xr_view(head_img.bgr, lw, rw))  # 頭部 + 左右手首(PiP) を headset へ
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
         arm_ctrl.speed_gradual_max()
         # main loop. robot start to follow VR user's motion
         while not STOP:
             start_time = time.time()
-            # get image
+            # get image (記録 or headset表示 のどちらでも取得)
             if camera_config['head_camera']['enable_zmq']:
                 if args.record or xr_need_local_img:
                     head_img = img_client.get_head_frame()
-                if xr_need_local_img:
-                    tv_wrapper.render_to_xr(head_img)
             if camera_config['left_wrist_camera']['enable_zmq']:
-                if args.record:
+                if args.record or xr_need_local_img:
                     left_wrist_img = img_client.get_left_wrist_frame()
             if camera_config['right_wrist_camera']['enable_zmq']:
-                if args.record:
+                if args.record or xr_need_local_img:
                     right_wrist_img = img_client.get_right_wrist_frame()
+            # headset へ: 頭部 + 左右手首(PiP) を合成して描画
+            if xr_need_local_img and camera_config['head_camera']['enable_zmq']:
+                lw = left_wrist_img.bgr if camera_config['left_wrist_camera']['enable_zmq'] else None
+                rw = right_wrist_img.bgr if camera_config['right_wrist_camera']['enable_zmq'] else None
+                tv_wrapper.render_to_xr(compose_xr_view(head_img.bgr, lw, rw))
 
             # record mode
             if args.record and RECORD_TOGGLE:
