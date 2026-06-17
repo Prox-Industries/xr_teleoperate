@@ -4,6 +4,7 @@ from multiprocessing import Value, Array, Lock
 import threading
 import logging_mp
 import cv2
+import numpy as np
 logging_mp.basicConfig(level=logging_mp.INFO)
 logger_mp = logging_mp.getLogger(__name__)
 
@@ -21,6 +22,7 @@ from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
+from teleop.arm_teach_motion import load_traj, make_grav, play
 from sshkeyboard import listen_keyboard, stop_listening
 
 # for simulation
@@ -37,6 +39,10 @@ STOP           = False  # Enable to begin system exit procedure
 READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNING state
 RECORD_RUNNING = False  # True if [Recording]
 RECORD_TOGGLE  = False  # Toggle recording state
+SYNCING        = False  # r トグル: True=操作者に追従, False=その姿勢で固定
+SYNC_TOGGLE    = False  # r 押下で同期ON/OFFを切替える要求フラグ
+raised         = False  # 起動時挙上を実行したか(終了時の逆再生降下の可否)
+safe_exit      = False  # 意図的終了(q/Ctrl+C)か(=逆再生で降下、例外時は go_home 直行)
 #  -------        ---------                -----------                -----------            ---------
 #   state          [Ready]      ==>        [Recording]     ==>         [AutoSave]     -->     [Ready]
 #  -------        ---------      |         -----------      |         -----------      |     ---------
@@ -50,9 +56,9 @@ RECORD_TOGGLE  = False  # Toggle recording state
 #  --> auto  : Auto-transition after saving data.
 
 def on_press(key):
-    global STOP, START, RECORD_TOGGLE
+    global STOP, START, RECORD_TOGGLE, SYNC_TOGGLE
     if key == 'r':
-        START = True
+        SYNC_TOGGLE = True            # 同期(追従) 開始/停止 のトグル要求
     elif key == 'q':
         START = False
         STOP = True
@@ -80,9 +86,9 @@ def compose_xr_view(head_bgr, left_bgr=None, right_bgr=None):
     h, w = view.shape[:2]
     pip_w, pip_h = max(1, w // 4), max(1, h // 4)
     if left_bgr is not None:
-        view[h - pip_h:h, 0:pip_w] = cv2.resize(left_bgr, (pip_w, pip_h))       # 左下: 左手首
+        view[0:pip_h, 0:pip_w] = cv2.resize(left_bgr, (pip_w, pip_h))       # 左上: 左手首
     if right_bgr is not None:
-        view[h - pip_h:h, w - pip_w:w] = cv2.resize(right_bgr, (pip_w, pip_h))  # 右下: 右手首
+        view[0:pip_h, w - pip_w:w] = cv2.resize(right_bgr, (pip_w, pip_h))  # 右上: 右手首
     return view
 
 if __name__ == '__main__':
@@ -108,6 +114,13 @@ if __name__ == '__main__':
     parser.add_argument('--task-goal', type = str, default = 'pick up cube.', help = 'task goal for recording at json file')
     parser.add_argument('--task-desc', type = str, default = 'task description', help = 'task description for recording at json file')
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
+    # 起動時アーム挙上 (teaching playback)
+    parser.add_argument('--raise-traj', type=str, default='utils/teach/raise_teach.npz', help='起動時の初期姿勢挙上に使う記録軌道(npz)')
+    parser.add_argument('--raise-vel', type=float, default=10.0, help='挙上/降下の速度上限(rad/s)')
+    parser.add_argument('--raise-delay', type=float, default=5.0, help='起動後、自動挙上までの待機秒(安全確認)')
+    parser.add_argument('--no-raise', action='store_true', help='起動時の自動挙上を無効化(従来動作)')
+    parser.add_argument('--no-mirror', action='store_true', help='挙上軌道の左右ミラーを無効化')
+    parser.add_argument('--raise-grav', type=float, default=1.0, help='挙上/降下/固定の重力補償スケール(垂れるなら>1)')
 
     args = parser.parse_args()
     logger_mp.info(f"args: {args}")
@@ -171,6 +184,24 @@ if __name__ == '__main__':
         elif args.arm == "H1":
             arm_ik = H1_ArmIK()
             arm_ctrl = H1_ArmController(simulation_mode=args.sim)
+
+        # 起動直後、コントローラ既定の q_target=0 (この機体では前方挙上姿勢) へ
+        # ドリフトするのを防ぐ: セットアップ中ずっと現在姿勢を保持
+        arm_ctrl.ctrl_dual_arm(arm_ctrl.get_current_dual_arm_q(), np.zeros(14))
+
+        # 起動時アーム挙上(teaching playback): 軌道ロード + 重力補償関数
+        raise_traj = None
+        raise_dt = None
+        grav_fn = None
+        if not args.no_raise:
+            try:
+                _rt = args.raise_traj if os.path.isabs(args.raise_traj) else os.path.join(current_dir, args.raise_traj)
+                raise_traj, raise_dt = load_traj(_rt, mirror=not args.no_mirror)
+                grav_fn = make_grav(arm_ik.reduced_robot.model, scale=args.raise_grav)
+                logger_mp.info(f"[raise] 軌道ロード: {raise_traj.shape[0]} samples, dt={raise_dt:.3f}, mirror={not args.no_mirror}")
+            except Exception as e:
+                logger_mp.error(f"[raise] 軌道ロード失敗 → 起動時挙上は無効: {e}")
+                raise_traj = None
 
         # end-effector
         if args.ee == "dex3":
@@ -262,17 +293,38 @@ if __name__ == '__main__':
             logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
         logger_mp.info("🔴  Press [q] to stop and exit the program.")
         logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
-        READY = True                  # now ready to (1) enter START state
-        while not START and not STOP: # wait for start or stop signal.
-            time.sleep(0.033)
+        READY = True
+        raised = False
+
+        def _render_xr():
             if xr_need_local_img and camera_config['head_camera']['enable_zmq']:
-                head_img = img_client.get_head_frame()
+                hi = img_client.get_head_frame()
                 lw = img_client.get_left_wrist_frame().bgr if camera_config['left_wrist_camera']['enable_zmq'] else None
                 rw = img_client.get_right_wrist_frame().bgr if camera_config['right_wrist_camera']['enable_zmq'] else None
-                tv_wrapper.render_to_xr(compose_xr_view(head_img.bgr, lw, rw))  # 頭部 + 左右手首(PiP) を headset へ
+                tv_wrapper.render_to_xr(compose_xr_view(hi.bgr, lw, rw))
 
-        logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
-        arm_ctrl.speed_gradual_max()
+        # ===== 起動: npz軌道で初期姿勢へ自動挙上(横から) =====
+        if raise_traj is not None:
+            logger_mp.info(f"起動: {args.raise_delay:.0f}秒後に初期姿勢へ挙上します。周囲をクリアに / L2+B 即押せる状態で ([Ctrl+C]で中止)")
+            _t = time.time()
+            while (time.time() - _t < args.raise_delay) and not STOP:
+                _render_xr(); time.sleep(0.1)
+            if not STOP:
+                logger_mp.info("[raise] 初期姿勢へ挙上中...")
+                play(arm_ctrl, raise_traj, raise_dt, grav=grav_fn, reverse=False,
+                     vel=args.raise_vel, move_to_start=True, stop_check=lambda: STOP)
+                raised = True
+                logger_mp.info("[raise] 初期姿勢に到達。")
+        else:
+            logger_mp.info("起動時挙上は無効(--no-raise / ロード失敗)。現在姿勢から開始します。")
+
+        START = True
+        SYNCING = False
+        SYNC_TOGGLE = False
+        frozen_q = arm_ctrl.get_current_dual_arm_q()   # 初期姿勢を保持対象として捕捉(垂れ/ドリフト防止)
+        logger_mp.info("----------------------------------------------------------------")
+        logger_mp.info("🟢  [r] = 同期(追従) 開始/停止 トグル    🔴  [q] = 終了(逆再生で降下)")
+        logger_mp.info("---------------------🚀 ready 🚀-------------------------")
         # main loop. robot start to follow VR user's motion
         while not STOP:
             start_time = time.time()
@@ -292,7 +344,27 @@ if __name__ == '__main__':
                 rw = right_wrist_img.bgr if camera_config['right_wrist_camera']['enable_zmq'] else None
                 tv_wrapper.render_to_xr(compose_xr_view(head_img.bgr, lw, rw))
 
-            # record mode
+            # ===== r トグル: 同期(追従) ⇄ 固定 =====
+            if SYNC_TOGGLE:
+                SYNC_TOGGLE = False
+                SYNCING = not SYNCING
+                if SYNCING:
+                    arm_ctrl.speed_gradual_max()   # 同期開始のたびに速度をゆるやかに立ち上げ
+                    logger_mp.info("▶  同期開始(追従)")
+                else:
+                    frozen_q = arm_ctrl.get_current_dual_arm_q()
+                    logger_mp.info("⏸  同期停止: 現姿勢で固定")
+            if not SYNCING:
+                # 固定: 捕捉した姿勢を重力補償つきで保持(ハンド更新なし、記録もしない)
+                if RECORD_TOGGLE:
+                    RECORD_TOGGLE = False
+                    logger_mp.warning("固定中は記録できません([r]で同期してから[s])")
+                fq = frozen_q if frozen_q is not None else arm_ctrl.get_current_dual_arm_q()
+                arm_ctrl.ctrl_dual_arm(fq, grav_fn(fq) if grav_fn is not None else np.zeros(14))
+                time.sleep(max(0, (1 / args.frequency) - (time.time() - start_time)))
+                continue
+
+            # record mode (同期中のみ処理)
             if args.record and RECORD_TOGGLE:
                 RECORD_TOGGLE = False
                 if not RECORD_RUNNING:
@@ -498,16 +570,32 @@ if __name__ == '__main__':
             time.sleep(sleep_time)
             logger_mp.debug(f"main process sleep: {sleep_time}")
 
+        safe_exit = True   # 正常終了(q) → finally で逆再生降下
+
     except KeyboardInterrupt:
         logger_mp.info("⛔ KeyboardInterrupt, exiting program...")
+        safe_exit = True   # Ctrl+C も意図的終了 → 逆再生で降下
     except Exception:
         import traceback
         logger_mp.error(traceback.format_exc())
     finally:
-        try:
-            arm_ctrl.ctrl_dual_arm_go_home()
-        except Exception as e:
-            logger_mp.error(f"Failed to ctrl_dual_arm_go_home: {e}")
+        # 意図的終了(q/Ctrl+C)かつ挙上済みなら、逆再生で降下し『その姿勢(記録開始=下げ姿勢)で終える』。
+        # go_home(=q=0=この機体では前方挙上) は降下できなかった時(例外/挙上なし)のみフォールバック。
+        descended = False
+        if raised and safe_exit and raise_traj is not None:
+            try:
+                logger_mp.info("[lower] 逆再生で降下します(現在姿勢から)...")
+                arm_ctrl._speed_gradual_max = False
+                play(arm_ctrl, raise_traj, raise_dt, grav=grav_fn, reverse=True,
+                     from_current=True, vel=args.raise_vel, move_to_start=True)
+                descended = True
+            except Exception as e:
+                logger_mp.error(f"[lower] 逆再生失敗 → go_home: {e}")
+        if not descended:
+            try:
+                arm_ctrl.ctrl_dual_arm_go_home()
+            except Exception as e:
+                logger_mp.error(f"Failed to ctrl_dual_arm_go_home: {e}")
         
         try:
             if args.ipc:
