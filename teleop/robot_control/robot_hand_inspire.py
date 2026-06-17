@@ -15,11 +15,27 @@ Inspire_Num_Motors = 6
 kTopicInspireDFXCommand = "rt/inspire/cmd"
 kTopicInspireDFXState = "rt/inspire/state"
 
+
+def _lpf_alpha(cutoff_hz, fps):
+    """1st-order (RC) low-pass smoothing coefficient for a loop sampled at `fps` [Hz].
+
+    Used as:  y[n] = y[n-1] + alpha * (x[n] - y[n-1]).
+    - cutoff_hz: filter cutoff frequency [Hz]. Smaller -> smoother / more lag,
+                 larger -> more responsive / less smoothing.
+    - returns alpha=1.0 (pass-through, i.e. filter disabled) when cutoff_hz<=0.
+    """
+    if cutoff_hz is None or cutoff_hz <= 0.0 or fps <= 0.0:
+        return 1.0
+    dt = 1.0 / fps
+    rc = 1.0 / (2.0 * np.pi * cutoff_hz)
+    return dt / (rc + dt)
+
 class Inspire_Controller_DFX:
     def __init__(self, left_hand_array, right_hand_array, dual_hand_data_lock = None, dual_hand_state_array = None,
-                       dual_hand_action_array = None, fps = 100.0, Unit_Test = False, simulation_mode = False):
+                       dual_hand_action_array = None, fps = 100.0, lpf_cutoff = 5.0, Unit_Test = False, simulation_mode = False):
         logger_mp.info("Initialize Inspire_Controller_DFX...")
         self.fps = fps
+        self.lpf_cutoff = lpf_cutoff
         self.Unit_Test = Unit_Test
         self.simulation_mode = simulation_mode
         if not self.Unit_Test:
@@ -87,6 +103,12 @@ class Inspire_Controller_DFX:
         left_q_target  = np.full(Inspire_Num_Motors, 1.0)
         right_q_target = np.full(Inspire_Num_Motors, 1.0)
 
+        # 1st-order low-pass filter state on the [0,1] target q (smooths teleop jitter).
+        # Lazily initialized to the first command so there is no startup jump.
+        lpf_alpha = _lpf_alpha(self.lpf_cutoff, self.fps)
+        filt_left_q  = None
+        filt_right_q = None
+
         # initialize inspire hand's cmd msg
         self.hand_msg  = MotorCmds_()
         self.hand_msg.cmds = [unitree_go_msg_dds__MotorCmd_() for _ in range(len(Inspire_Right_Hand_JointIndex) + len(Inspire_Left_Hand_JointIndex))]
@@ -136,8 +158,18 @@ class Inspire_Controller_DFX:
                             left_q_target[idx]  = normalize(left_q_target[idx], -0.1, 1.3)
                             right_q_target[idx] = normalize(right_q_target[idx], -0.1, 1.3)
 
+                # smooth the [0,1] target q with a 1st-order low-pass filter before sending.
+                # filtered values are also what gets recorded below, so logged action == sent command.
+                if filt_left_q is None:
+                    filt_left_q  = left_q_target.copy()
+                    filt_right_q = right_q_target.copy()
+                else:
+                    filt_left_q  += lpf_alpha * (left_q_target  - filt_left_q)
+                    filt_right_q += lpf_alpha * (right_q_target - filt_right_q)
+                left_q_target, right_q_target = filt_left_q, filt_right_q
+
                 # get dual hand action
-                action_data = np.concatenate((left_q_target, right_q_target))    
+                action_data = np.concatenate((left_q_target, right_q_target))
                 if dual_hand_state_array and dual_hand_action_array:
                     with dual_hand_data_lock:
                         dual_hand_state_array[:] = state_data
