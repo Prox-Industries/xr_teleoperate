@@ -86,6 +86,7 @@ class Inspire_Controller_DFX:
 
         left_q_target  = np.full(Inspire_Num_Motors, 1.0)
         right_q_target = np.full(Inspire_Num_Motors, 1.0)
+        previous_action_data = np.concatenate((left_q_target, right_q_target))
 
         # initialize inspire hand's cmd msg
         self.hand_msg  = MotorCmds_()
@@ -104,9 +105,6 @@ class Inspire_Controller_DFX:
                     left_hand_data  = np.array(left_hand_array[:]).reshape(25, 3).copy()
                 with right_hand_array.get_lock():
                     right_hand_data = np.array(right_hand_array[:]).reshape(25, 3).copy()
-
-                # Read left and right q_state from shared arrays
-                state_data = np.concatenate((np.array(left_hand_state_array[:]), np.array(right_hand_state_array[:])))
 
                 if not np.all(right_hand_data == 0.0) and not np.all(left_hand_data[4] == np.array([-1.13, 0.3, 0.15])): # if hand data has been initialized.
                     ref_left_value = left_hand_data[self.hand_retargeting.left_indices[1,:]] - left_hand_data[self.hand_retargeting.left_indices[0,:]]
@@ -140,10 +138,14 @@ class Inspire_Controller_DFX:
                 action_data = np.concatenate((left_q_target, right_q_target))    
                 if dual_hand_state_array and dual_hand_action_array:
                     with dual_hand_data_lock:
-                        dual_hand_state_array[:] = state_data
+                        # DFX rt/inspire/state reports raw, mostly stale values on this setup.
+                        # Use the previous normalized command as the observable hand state,
+                        # matching inference where the current hand state is the last command sent.
+                        dual_hand_state_array[:] = previous_action_data
                         dual_hand_action_array[:] = action_data
 
                 self.ctrl_dual_hand(left_q_target, right_q_target)
+                previous_action_data = action_data.copy()
                 current_time = time.time()
                 time_elapsed = current_time - start_time
                 sleep_time = max(0, (1 / self.fps) - time_elapsed)
